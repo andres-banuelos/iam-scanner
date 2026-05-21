@@ -1,157 +1,94 @@
-"""
-risk_scoring.py — Severity scoring, compliance mapping, and weighted risk calculation.
-
-Weighted formula:
-    base_score  = severity_weight  (High=3, Medium=2, Low=1)
-    scope_mult  = 1 + (affected_count / total_users) * 0.5   # breadth of exposure
-    risk_score  = base_score * scope_mult  (capped at 5.0)
-
-Every finding is mapped to:
-  - SOX ITGC domain    (Access Management | Security Operations | Change Management)
-  - NIST 800-53 family (AC, IA, AU, CM, SI)
-"""
-
 from dataclasses import dataclass, field
 from typing import Optional
 
-
-SEVERITY_WEIGHTS = {"High": 3, "Medium": 2, "Low": 1}
-
-COMPLIANCE_MAP = {
-    "NO_MFA": {
-        "sox_domain":   "Access Management",
-        "sox_control":  "SOX ITGC – Logical Access Controls",
-        "nist_family":  "IA-2 (Identification and Authentication)",
-        "nist_control": "IA-2(1): MFA for privileged accounts; IA-2(2): MFA for non-privileged accounts",
-        "audit_context": (
-            "SOX Section 404 requires that access to financial reporting systems be "
-            "appropriately restricted. MFA is a compensating control that prevents "
-            "unauthorized access even when passwords are compromised. Absence of MFA "
-            "for accounts with access to financial systems is a common SOX ITGC deficiency "
-            "that can escalate to a material weakness if pervasive."
-        ),
-    },
-    "STALE_ACCESS_KEY": {
-        "sox_domain":   "Access Management",
-        "sox_control":  "SOX ITGC – Access Review & Recertification",
-        "nist_family":  "AC-2 (Account Management)",
-        "nist_control": "AC-2(3): Disable inactive accounts; AC-3: Access enforcement",
-        "audit_context": (
-            "PCAOB standards and SOX ITGC require periodic review of access credentials. "
-            "Access keys older than 90 days without rotation represent stale credentials "
-            "that could be exploited if leaked. Quarterly access reviews must include "
-            "key rotation verification for all programmatic access to financial systems."
-        ),
-    },
-    "UNUSED_ACCESS_KEY": {
-        "sox_domain":   "Access Management",
-        "sox_control":  "SOX ITGC – Access Review & Recertification",
-        "nist_family":  "AC-2 (Account Management)",
-        "nist_control": "AC-2(3): Disable inactive accounts; AC-6: Least privilege",
-        "audit_context": (
-            "An access key that has never been used or has not been used in 90+ days "
-            "indicates access provisioned but not required — violating least-privilege "
-            "principles. Auditors flag these as ghost credentials, which expand the "
-            "attack surface and demonstrate a breakdown in access recertification processes."
-        ),
-    },
-    "WILDCARD_POLICY": {
-        "sox_domain":   "Access Management",
-        "sox_control":  "SOX ITGC – Least Privilege / Segregation of Duties",
-        "nist_family":  "AC-6 (Least Privilege)",
-        "nist_control": "AC-6: Least privilege; AC-6(1): Authorize access to security functions",
-        "audit_context": (
-            "Policies granting \"*:*\" (all actions on all resources) violate the principle "
-            "of least privilege and segregation of duties — two foundational SOX ITGC "
-            "requirements. In a SOX context, if a developer can both commit code AND deploy "
-            "to production due to wildcard permissions, this constitutes a SoD conflict "
-            "that auditors will flag as a significant deficiency."
-        ),
-    },
-    "STALE_USER": {
-        "sox_domain":   "Access Management",
-        "sox_control":  "SOX ITGC – User Access Review",
-        "nist_family":  "AC-2 (Account Management)",
-        "nist_control": "AC-2(3): Disable inactive accounts; AC-2(4): Automated audit actions",
-        "audit_context": (
-            "SOX ITGC requires that user access to systems supporting financial reporting "
-            "be reviewed at least quarterly. Accounts inactive for 90+ days are a red flag "
-            "in any access review — they may belong to terminated employees or contractors "
-            "whose offboarding was not properly executed, representing a direct control failure."
-        ),
-    },
-    "ROOT_ACCESS_KEY": {
-        "sox_domain":   "Security Operations",
-        "sox_control":  "SOX ITGC – Privileged Access Management",
-        "nist_family":  "AC-6 (Least Privilege) + IA-2 (Authentication)",
-        "nist_control": "AC-6(9): Log use of privileged functions; IA-2(1): MFA for privileged",
-        "audit_context": (
-            "The AWS root account has unrestricted access to all resources with no IAM "
-            "boundary. Active root access keys bypass all permission boundaries and cannot "
-            "be restricted by SCPs. Auditors treat active root keys as an immediate "
-            "High-severity finding — AWS itself recommends deleting root access keys as "
-            "a Day 1 security baseline. This directly threatens financial data integrity."
-        ),
-    },
-    "WEAK_PASSWORD_POLICY": {
-        "sox_domain":   "Security Operations",
-        "sox_control":  "SOX ITGC – Authentication Standards",
-        "nist_family":  "IA-5 (Authenticator Management)",
-        "nist_control": "IA-5(1): Password-based authentication complexity and expiry",
-        "audit_context": (
-            "Password policy weaknesses indicate a failure to implement baseline "
-            "authentication controls required by SOX ITGC. A weak or absent password "
-            "policy makes brute-force and credential-stuffing attacks more viable, "
-            "threatening the confidentiality and integrity of financial reporting systems. "
-            "Auditors will test password policy configuration as a standard GITC test."
-        ),
-    },
-}
-
+@dataclass
+class ComplianceMapping:
+    nist_controls: list
+    sox_domain: str
+    sox_control_objective: str
 
 @dataclass
 class Finding:
-    """Represents a single IAM misconfiguration finding."""
-    check_id:       str
-    title:          str
-    severity:       str          # High | Medium | Low
-    resource:       str          # Affected resource (user, policy ARN, etc.)
-    detail:         str          # Human-readable description
-    remediation:    str          # Plain-English fix recommendation
-    # Populated by enrich()
-    sox_domain:     str = ""
-    sox_control:    str = ""
-    nist_family:    str = ""
-    nist_control:   str = ""
-    audit_context:  str = ""
-    risk_score:     float = 0.0
+    check_id: str
+    title: str
+    severity: str
+    affected_resource: str
+    description: str
+    audit_context: str
+    remediation: str
+    compliance: ComplianceMapping
+    risk_score: float = 0.0
+    details: dict = field(default_factory=dict)
 
-    def enrich(self, total_users: int = 1, affected_count: int = 1) -> "Finding":
-        """Attach compliance metadata and compute weighted risk score."""
-        mapping = COMPLIANCE_MAP.get(self.check_id, {})
-        self.sox_domain    = mapping.get("sox_domain",    "General Security")
-        self.sox_control   = mapping.get("sox_control",   "SOX ITGC")
-        self.nist_family   = mapping.get("nist_family",   "")
-        self.nist_control  = mapping.get("nist_control",  "")
-        self.audit_context = mapping.get("audit_context", "")
+COMPLIANCE_MAP = {
+    "NO_MFA": ComplianceMapping(
+        nist_controls=["IA-2", "IA-2(1)", "IA-5"],
+        sox_domain="SOX ITGC – Logical Access (LA)",
+        sox_control_objective="Management must ensure MFA is required for financial system access.",
+    ),
+    "STALE_ACCESS_KEY": ComplianceMapping(
+        nist_controls=["AC-2", "IA-5", "IA-5(1)"],
+        sox_domain="SOX ITGC – Logical Access (LA)",
+        sox_control_objective="Access credentials must be rotated on a defined schedule (≤90 days).",
+    ),
+    "UNUSED_ACCESS_KEY": ComplianceMapping(
+        nist_controls=["AC-2(3)", "IA-4", "AC-17"],
+        sox_domain="SOX ITGC – Logical Access (LA)",
+        sox_control_objective="Unused credentials represent dormant attack surface; periodic access reviews must identify and revoke them.",
+    ),
+    "WILDCARD_POLICY": ComplianceMapping(
+        nist_controls=["AC-6", "AC-6(1)", "AC-6(2)"],
+        sox_domain="SOX ITGC – Security (SEC)",
+        sox_control_objective="Principle of least privilege: users must be granted only minimum permissions necessary.",
+    ),
+    "INACTIVE_USER": ComplianceMapping(
+        nist_controls=["AC-2", "AC-2(3)", "AC-3"],
+        sox_domain="SOX ITGC – Logical Access (LA)",
+        sox_control_objective="Periodic user access reviews must identify and disable accounts inactive 90+ days.",
+    ),
+    "ROOT_ACCESS_KEY": ComplianceMapping(
+        nist_controls=["AC-6(9)", "IA-2", "AU-2"],
+        sox_domain="SOX ITGC – Security (SEC)",
+        sox_control_objective="Root account must not have active access keys; all admin actions via named IAM users.",
+    ),
+    "WEAK_PASSWORD_POLICY": ComplianceMapping(
+        nist_controls=["IA-5", "IA-5(1)", "IA-12"],
+        sox_domain="SOX ITGC – Logical Access (LA)",
+        sox_control_objective="Password policies must enforce minimum length, complexity, and rotation requirements.",
+    ),
+}
 
-        base   = SEVERITY_WEIGHTS.get(self.severity, 1)
-        scope  = 1 + (affected_count / max(total_users, 1)) * 0.5
-        self.risk_score = round(min(base * scope, 5.0), 2)
-        return self
+BASE_SCORES = {
+    "NO_MFA": 7.5,
+    "STALE_ACCESS_KEY": 6.0,
+    "UNUSED_ACCESS_KEY": 5.5,
+    "WILDCARD_POLICY": 8.5,
+    "INACTIVE_USER": 5.0,
+    "ROOT_ACCESS_KEY": 10.0,
+    "WEAK_PASSWORD_POLICY": 6.5,
+}
 
-    def to_dict(self) -> dict:
-        return {
-            "check_id":      self.check_id,
-            "title":         self.title,
-            "severity":      self.severity,
-            "resource":      self.resource,
-            "detail":        self.detail,
-            "remediation":   self.remediation,
-            "sox_domain":    self.sox_domain,
-            "sox_control":   self.sox_control,
-            "nist_family":   self.nist_family,
-            "nist_control":  self.nist_control,
-            "audit_context": self.audit_context,
-            "risk_score":    self.risk_score,
-        }
+def calculate_risk_score(check_id: str, context: Optional[dict] = None) -> tuple:
+    """
+    Returns (score, severity) where score in [0, 10].
+    Formula: risk_score = base_score + context_modifier
+    Context keys: days_stale (int), attached_users (int), never_used (bool)
+    """
+    base = BASE_SCORES.get(check_id, 5.0)
+    modifier = 0.0
+    ctx = context or {}
+    if ctx.get("never_used"):
+        modifier += 0.5
+    days = ctx.get("days_stale", 0)
+    if days > 180:
+        modifier += 0.8
+    elif days > 90:
+        modifier += 0.4
+    attached = ctx.get("attached_users", 0)
+    if attached > 10:
+        modifier += 0.5
+    elif attached > 5:
+        modifier += 0.2
+    score = min(round(base + modifier, 1), 10.0)
+    severity = "HIGH" if score >= 8.0 else "MEDIUM" if score >= 5.0 else "LOW"
+    return score, severity

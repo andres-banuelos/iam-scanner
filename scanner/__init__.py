@@ -1,1 +1,1 @@
-"""scanner package — AWS IAM Misconfiguration Scanner"""
+"""IAM Scanner package."""
