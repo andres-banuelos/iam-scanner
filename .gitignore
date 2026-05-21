@@ -1,21 +1,12 @@
-# Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-.Python
-venv/
-env/
 .env
-
-# Outputs
+.venv/
+venv/
 outputs/*.pdf
 outputs/*.json
-
-# IDE
 .idea/
-.vscode/
-*.iml
-
-# OS
-.DS_Store
-Thumbs.db
+*.egg-info/
+dist/
+build/
